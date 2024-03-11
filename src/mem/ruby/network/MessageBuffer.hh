@@ -192,6 +192,8 @@ class MessageBuffer : public SimObject
 
     int routingPriority() const { return m_routing_priority; }
 
+    std::vector<MsgPtr> m_prio_heap;
+
   private:
     void reanalyzeList(std::list<MsgPtr> &, Tick);
 
@@ -201,7 +203,7 @@ class MessageBuffer : public SimObject
     // Data Members (m_ prefix)
     //! Consumer to signal a wakeup(), can be NULL
     Consumer* m_consumer;
-    std::vector<MsgPtr> m_prio_heap;
+    //std::vector<MsgPtr> m_prio_heap;  // Move to public for hacking
 
     std::function<void()> m_dequeue_callback;
 

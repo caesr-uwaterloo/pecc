@@ -58,7 +58,11 @@ using stl_helpers::operator<<;
 
 Switch::Switch(const Params &p)
   : BasicRouter(p),
+#ifdef SNOOPING_BUS
+    perfectSwitch(m_id, this, p.virt_nets, p.num_processor, p.tdm_slot_width, p.resp_bus_slot_width),
+#else
     perfectSwitch(m_id, this, p.virt_nets),
+#endif
     m_int_routing_latency(p.int_routing_latency),
     m_ext_routing_latency(p.ext_routing_latency),
     m_routing_unit(*p.routing_unit), m_num_connected_buffers(0),

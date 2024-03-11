@@ -488,6 +488,10 @@ DistPrint::operator()(std::ostream &stream) const
     print.value = data.samples;
     print(stream);
 
+    print.name = base + "max_val";
+    print.value = data.max_val;
+    print(stream);
+
     print.name = base + "mean";
     print.value = data.samples ? data.sum / data.samples : Nan;
     print(stream);

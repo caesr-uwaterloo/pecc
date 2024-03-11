@@ -31,6 +31,9 @@ Import('*')
 if env['CONF']['PROTOCOL'] == 'None':
     Return()
 
+if env['CONF']['PROTOCOL'] == 'EXCL' or env['CONF']['PROTOCOL'] == 'INCL':
+    env.Append(CPPDEFINES=['SNOOPING_BUS'])
+
 SimObject('BasicLink.py', sim_objects=[
     'BasicLink', 'BasicExtLink', 'BasicIntLink'])
 SimObject('BasicRouter.py', sim_objects=['BasicRouter'])

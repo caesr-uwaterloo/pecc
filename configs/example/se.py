@@ -125,6 +125,12 @@ if '--ruby' in sys.argv:
 
 args = parser.parse_args()
 
+if buildEnv['PROTOCOL'] == 'EXCL' or buildEnv['PROTOCOL'] == 'INCL':
+    # override clock frequency settings for EXCL and INCL to simulate high speed bus in ruby system
+    args.cpu_clock = "2GHz"
+    args.ruby_clock = "4GHz"
+    args.sys_clock = "2GHz"
+
 multiprocesses = []
 numThreads = 1
 
@@ -176,7 +182,7 @@ if numThreads > 1:
 system.voltage_domain = VoltageDomain(voltage = args.sys_voltage)
 
 # Create a source clock for the system and set the clock period
-system.clk_domain = SrcClockDomain(clock =  args.sys_clock,
+system.clk_domain = SrcClockDomain(clock = args.sys_clock,
                                    voltage_domain = system.voltage_domain)
 
 # Create a CPU voltage domain

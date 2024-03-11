@@ -51,6 +51,12 @@
 #include "mem/ruby/network/simple/Switch.hh"
 #include "mem/ruby/slicc_interface/Message.hh"
 
+// Required include for TDM hacking
+#include "mem/ruby/protocol/RequestMsg.hh"
+#include "mem/ruby/protocol/ResponseMsg.hh"
+#include "debug/TDM.hh"
+
+
 namespace gem5
 {
 
@@ -59,6 +65,15 @@ namespace ruby
 
 const int PRIORITY_SWITCH_LIMIT = 128;
 
+#ifdef SNOOPING_BUS
+PerfectSwitch::PerfectSwitch(SwitchID sid, Switch *sw, uint32_t virt_nets, int num_processor, int tdm_slot_width, int resp_bus_slot_width)
+    : Consumer(sw, Switch::PERFECTSWITCH_EV_PRI),
+      m_switch_id(sid), m_switch(sw), m_num_processor(num_processor), m_tdm_slot_width(tdm_slot_width), m_resp_bus_slot_width(resp_bus_slot_width)
+{
+    m_wakeups_wo_switch = 0;
+    m_virtual_networks = virt_nets;
+}
+#else
 PerfectSwitch::PerfectSwitch(SwitchID sid, Switch *sw, uint32_t virt_nets)
     : Consumer(sw, Switch::PERFECTSWITCH_EV_PRI),
       m_switch_id(sid), m_switch(sw)
@@ -66,6 +81,7 @@ PerfectSwitch::PerfectSwitch(SwitchID sid, Switch *sw, uint32_t virt_nets)
     m_wakeups_wo_switch = 0;
     m_virtual_networks = virt_nets;
 }
+#endif
 
 void
 PerfectSwitch::init(SimpleNetwork *network_ptr)
@@ -294,7 +310,17 @@ PerfectSwitch::wakeup()
     for (int vnet = highest_prio_vnet;
          (vnet * decrementer) >= (decrementer * lowest_prio_vnet);
          vnet -= decrementer) {
+#ifdef SNOOPING_BUS
+        if ((vnet == 0) && (m_switch_id == 0)) {
+            operateTDMRequestBus(vnet);
+        } else if ((vnet == 2) && (m_switch_id == 0)) {
+            operateOARespBus(vnet);
+        } else {
+            operateVnet(vnet);
+        }
+#else
         operateVnet(vnet);
+#endif
     }
 }
 
@@ -319,6 +345,259 @@ PerfectSwitch::print(std::ostream& out) const
 {
     out << "[PerfectSwitch " << m_switch_id << "]";
 }
+
+#ifdef SNOOPING_BUS
+bool
+PerfectSwitch::isStartOfSlot() {
+    uint64_t cur_cycle = m_switch->curCycle();
+    return (cur_cycle % m_tdm_slot_width == 0)? true : false;
+}
+
+uint64_t 
+PerfectSwitch::getNextSlotStartCycle () {
+    uint64_t cur_cycle = m_switch->curCycle();
+    return (cur_cycle / m_tdm_slot_width + 1) * m_tdm_slot_width;
+}
+
+void
+PerfectSwitch::operateTDMRequestBus(int vnet) {
+    assert(m_switch_id == 0);
+    
+    // We only perform TDM arbitration on vnet 0
+    assert(vnet == 0);
+
+    // Optimization: directly return if the current cycle is smaller than the next scheduled event
+    uint64_t current_cycle = m_switch->curCycle();
+    if (m_req_bus_next_free_cycle > current_cycle) {
+        return;
+    }
+
+    assert(m_in_prio_groups[vnet].size() == 1);  // sanity check
+    for (auto &in : m_in_prio_groups[vnet]) {
+        int j = m_request_bus_owner;
+        Tick current_time = m_switch->clockEdge();
+        MessageBuffer *in_buffer;
+
+        // Search for the next input buffer that has message ready
+        bool message_is_ready = false;
+        int num_in_port = in.size();
+        for (int i = 0; i < num_in_port; i++) {
+            in_buffer = in[j];
+            if (in_buffer->isReady(current_time)) {
+                message_is_ready = true;
+                break;
+            }
+            j = (j + 1) % num_in_port;
+        }
+
+        if (!message_is_ready) {
+            return;
+        }
+
+        if (isStartOfSlot()) {
+            // hack the message destination
+            MsgPtr in_msg_smart_ptr;
+            RequestMsg* in_msg_ptr = NULL;
+            in_msg_smart_ptr = in_buffer->peekMsgPtr();
+            in_msg_ptr = dynamic_cast<RequestMsg *> (in_msg_smart_ptr.get());
+            assert(in_msg_ptr);
+            NetDest& destination = in_msg_ptr->getDestination();
+            destination.clear();
+            destination.add(in_msg_ptr->getrequestor());
+            
+            // move the message to output buffer
+            operateMessageBufferOnce(in_buffer, vnet);
+            DPRINTF(TDM, "TDM arbitration: slot owner %d sent message\n ", j);
+
+            // update next owner
+            j = (j + 1) % num_in_port;
+            m_request_bus_owner = j;
+        }
+
+        uint64_t next_slot_start_cycle = getNextSlotStartCycle();
+        assert(next_slot_start_cycle > current_cycle);
+        scheduleEvent(Cycles(next_slot_start_cycle-current_cycle));
+        m_req_bus_next_free_cycle = next_slot_start_cycle;
+    }
+}
+
+
+// This function is basically a copy of operateMessageBuffer except that it only sends one message at a time
+void
+PerfectSwitch::operateMessageBufferOnce(MessageBuffer *buffer, int vnet)
+{
+    MsgPtr msg_ptr;
+    Message *net_msg_ptr = NULL;
+
+    // temporary vectors to store the routing results
+    static thread_local std::vector<BaseRoutingUnit::RouteInfo> output_links;
+
+    Tick current_time = m_switch->clockEdge();
+
+    bool msg_sent = false;
+
+    while (buffer->isReady(current_time)) {
+        DPRINTF(RubyNetwork, "incoming: %d\n", buffer->getIncomingLink());
+
+        // Peek at message
+        msg_ptr = buffer->peekMsgPtr();
+        net_msg_ptr = msg_ptr.get();
+        DPRINTF(RubyNetwork, "Message: %s\n", (*net_msg_ptr));
+
+
+        output_links.clear();
+        m_switch->getRoutingUnit().route(*net_msg_ptr, vnet,
+                                         m_network_ptr->isVNetOrdered(vnet),
+                                         output_links);
+
+        // Check for resources - for all outgoing queues
+        bool enough = true;
+        for (int i = 0; i < output_links.size(); i++) {
+            int outgoing = output_links[i].m_link_id;
+            OutputPort &out_port = m_out[outgoing];
+
+            if (!out_port.buffers[vnet]->areNSlotsAvailable(1, current_time))
+                enough = false;
+
+            DPRINTF(RubyNetwork, "Checking if node is blocked ..."
+                    "outgoing: %d, vnet: %d, enough: %d\n",
+                    outgoing, vnet, enough);
+        }
+
+        // There were not enough resources
+        if (!enough) {
+            scheduleEvent(Cycles(1));
+            DPRINTF(RubyNetwork, "Can't deliver message since a node "
+                    "is blocked\n");
+            DPRINTF(RubyNetwork, "Message: %s\n", (*net_msg_ptr));
+            break; // go to next incoming port
+        }
+
+        MsgPtr unmodified_msg_ptr;
+
+        if (output_links.size() > 1) {
+            // If we are sending this message down more than one link
+            // (size>1), we need to make a copy of the message so each
+            // branch can have a different internal destination we need
+            // to create an unmodified MsgPtr because the MessageBuffer
+            // enqueue func will modify the message
+
+            // This magic line creates a private copy of the message
+            unmodified_msg_ptr = msg_ptr->clone();
+        }
+
+        // Dequeue msg
+        buffer->dequeue(current_time);
+        m_pending_message_count[vnet]--;
+
+        // Enqueue it - for all outgoing queues
+        for (int i=0; i<output_links.size(); i++) {
+            int outgoing = output_links[i].m_link_id;
+            OutputPort &out_port = m_out[outgoing];
+
+            if (i > 0) {
+                // create a private copy of the unmodified message
+                msg_ptr = unmodified_msg_ptr->clone();
+            }
+
+            // Change the internal destination set of the message so it
+            // knows which destinations this link is responsible for.
+            net_msg_ptr = msg_ptr.get();
+            net_msg_ptr->getDestination() = output_links[i].m_destinations;
+
+            // Enqeue msg
+            DPRINTF(RubyNetwork, "Enqueuing net msg from "
+                    "inport[%d][%d] to outport [%d][%d].\n",
+                    buffer->getIncomingLink(), vnet, outgoing, vnet);
+
+            out_port.buffers[vnet]->enqueue(msg_ptr, current_time,
+                                           out_port.latency);
+        }
+
+        msg_sent = true;
+        break;  // We only want one message to be sent at a time
+    }
+
+    assert(msg_sent);  // sanity check: one message has been sent
+}
+
+void
+PerfectSwitch::operateOARespBus(int vnet) {
+    assert(m_switch_id == 0);
+    
+    // We only perform oldest age arbitration on response bus (i.e. vnet is 2)
+    assert(vnet == 2);
+
+    uint64_t current_cycle = m_switch->curCycle();
+    if (m_resp_bus_next_free_cycle > current_cycle) {
+        return;
+    }
+
+    assert(m_in_prio_groups[vnet].size() == 1);  // sanity check
+    for (auto &in : m_in_prio_groups[vnet]) {
+        Tick current_time = m_switch->clockEdge();
+        MessageBuffer *in_buffer;
+
+        // Search for the response message that has the highest priority (i.e. lowest request ID)
+        bool first_found = false;
+        Cycles lowest_ID = Cycles(0);
+        int found_port = 0;
+        int num_in_port = in.size();
+        for (int i = 0; i < num_in_port; i++) {
+            in_buffer = in[i];
+            for (int j = 0; j < in_buffer->m_prio_heap.size(); j++) {
+                ResponseMsg* in_msg_ptr = NULL;
+                in_msg_ptr = dynamic_cast<ResponseMsg *> (in_buffer->m_prio_heap[j].get());
+                assert(in_msg_ptr != NULL);
+
+                // if message is ready
+                if (in_msg_ptr->getLastEnqueueTime() <= current_time) {
+                    if (first_found == false) {
+                        lowest_ID = in_msg_ptr->m_reqID;
+                        found_port = i;
+                        first_found = true;
+                    } else if (in_msg_ptr->m_reqID < lowest_ID) {
+                        lowest_ID = in_msg_ptr->m_reqID;
+                        found_port = i;
+                    }
+                }
+            }
+        }
+
+        if (!first_found) {
+            return;
+        }
+
+        in_buffer = in[found_port];
+        bool found = false;
+        int buf_size = in_buffer->m_prio_heap.size();
+        while (true) {
+            if (buf_size < 0) {
+                break;
+            }
+            buf_size--;
+            ResponseMsg* in_msg_ptr = NULL;
+            in_msg_ptr = dynamic_cast<ResponseMsg *> (in_buffer->m_prio_heap.front().get());
+            assert(in_msg_ptr != NULL);
+            if (in_msg_ptr->m_reqID == lowest_ID) {
+                found = true;
+                break;
+            } else {
+                assert(in_msg_ptr->getLastEnqueueTime() <= current_time);
+                in_buffer->delayHead(current_time, 1);
+            }
+        }
+        assert(found == true);
+        
+        // move the message to output buffer
+        operateMessageBufferOnce(in_buffer, vnet);
+        m_resp_bus_next_free_cycle = current_cycle + m_resp_bus_slot_width;
+
+        DPRINTF(TDM, "OA arbitration: resp bus owner %d sent response message with reqID %d\n", found_port, lowest_ID);
+        scheduleEvent(Cycles(m_resp_bus_next_free_cycle-current_cycle));
+    }
+}
+#endif
 
 } // namespace ruby
 } // namespace gem5

@@ -1,0 +1,9 @@
+# -*- mode:python -*-
+
+Import('*')
+
+# Register this protocol with gem5/SCons
+
+main.Append(SLICC_INCLUDES=['mem/ruby/slicc_interface/EXCL_includes.hh'])
+main.Append(ALL_PROTOCOLS=['EXCL'])
+main.Append(PROTOCOL_DIRS=[Dir('.')])

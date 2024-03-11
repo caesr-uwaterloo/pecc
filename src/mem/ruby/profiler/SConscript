@@ -35,3 +35,6 @@ Source('AccessTraceForAddress.cc')
 Source('AddressProfiler.cc')
 Source('Profiler.cc')
 Source('StoreTrace.cc')
+
+SimObject('CustomProfiler.py', sim_objects=['CustomProfiler'])
+Source('CustomProfiler.cc')

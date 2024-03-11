@@ -545,12 +545,7 @@ RubySystem::functionalRead(PacketPtr pkt)
     // The reason is because the Backing_Store memory could easily be stale, if
     // there are copies floating around the cache hierarchy, so you want to read
     // it only if it's not in the cache hierarchy at all.
-    int num_controllers = netCntrls[request_net_id].size();
-    if (num_invalid == (num_controllers - 1) && num_backing_store == 1) {
-        DPRINTF(RubySystem, "only copy in Backing_Store memory, read from it\n");
-        ctrl_backing_store->functionalRead(line_address, pkt);
-        return true;
-    } else if (num_ro > 0 || num_rw >= 1) {
+    if (num_ro > 0 || num_rw >= 1) {
         if (num_rw > 1) {
             // We iterate over the vector of abstract controllers, and return
             // the first copy found. If we have more than one cache with block
@@ -592,6 +587,13 @@ RubySystem::functionalRead(PacketPtr pkt)
             if (network->functionalRead(pkt))
                 return true;
         }
+    }
+
+    // if we reach here, access backing store if present
+    if (num_backing_store == 1) {
+        DPRINTF(RubySystem, "only copy in Backing_Store memory, read from it\n");
+        ctrl_backing_store->functionalRead(line_address, pkt);
+        return true;
     }
 
     return false;

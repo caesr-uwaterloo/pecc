@@ -1,0 +1,6 @@
+protocol "INCL";
+include "RubySlicc_interfaces.slicc";
+include "INCL-msg.sm";
+include "INCL-L1cache.sm";
+include "INCL-L2cache.sm";
+include "INCL-Directory.sm";

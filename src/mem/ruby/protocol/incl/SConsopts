@@ -1,0 +1,8 @@
+# -*- mode:python -*-
+
+Import('*')
+
+# Register this protocol with gem5/SCons
+
+main.Append(ALL_PROTOCOLS=['INCL'])
+main.Append(PROTOCOL_DIRS=[Dir('.')])

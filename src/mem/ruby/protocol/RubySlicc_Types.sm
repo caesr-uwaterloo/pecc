@@ -250,3 +250,19 @@ structure (RubyPrefetcher, external = "yes") {
     void observePfHit(Addr);
     void observePfMiss(Addr);
 }
+
+// Custom profiler for gathering statistics
+structure(CustomProfiler, external="yes") {
+    void profileGetRequest();
+    void profileL1Hit();
+    void profileL1Miss();
+    void profileUpg();
+    void profileCacheToCacheTrf();
+    void profileLLCHit();
+    void profileMemoryRead();
+    void profileMemoryWrite();
+    void profileBackInvalidation();
+    void profileBackInvalidationWB();
+    void profilePutRequest();
+    void profileMemLatency(Cycles latency);
+}

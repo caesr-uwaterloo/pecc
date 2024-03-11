@@ -1,0 +1,139 @@
+diff -wpur libtiff/Makefile libtiff.2/Makefile
+--- libtiff/Makefile	1994-09-21 01:18:50.000000000 +0100
++++ libtiff.2/Makefile	2016-08-27 10:42:45.499230393 +0100
+@@ -29,7 +29,7 @@ DESTDIR=/usr/local
+ AR=	/usr/bin/ar
+ NULL=
+ 
+-IPATH=	-I. -I/usr/include/bsd
++IPATH=	-I.
+ #
+ # Library-wide configuration defines:
+ #    MMAP_SUPPORT	add support for memory mapping read-only files
+diff -wpur libtiff/mkg3states.c libtiff.2/mkg3states.c
+--- libtiff/mkg3states.c	1994-09-21 01:19:03.000000000 +0100
++++ libtiff.2/mkg3states.c	2016-08-27 10:43:27.543184289 +0100
+@@ -68,6 +68,7 @@ static char rcsid[] = "$Header: /usr/peo
+  * END (from the original source)
+  */
+ #include <stdio.h>
++#include <stdlib.h>
+ #include "prototypes.h"
+ 
+ #ifndef TRUE
+diff -wpur libtiff/tif_aux.c libtiff.2/tif_aux.c
+--- libtiff/tif_aux.c	1994-09-21 01:19:04.000000000 +0100
++++ libtiff.2/tif_aux.c	2016-08-27 10:52:28.377864274 +0100
+@@ -31,6 +31,7 @@ static char rcsid[] = "$Header: /usr/peo
+  *
+  * Auxiliary Support Routines.
+  */
++#include <math.h>
+ #include "tiffioP.h"
+ #include "prototypes.h"
+ 
+diff -wpur libtiff/tif_dir.c libtiff.2/tif_dir.c
+--- libtiff/tif_dir.c	1994-09-21 01:19:07.000000000 +0100
++++ libtiff.2/tif_dir.c	2016-08-27 10:52:46.981474167 +0100
+@@ -37,6 +37,7 @@ static char rcsid[] = "$Header: /usr/peo
+  *     carefully chosen to make things work with compilers that
+  *     are busted in one way or another (e.g. SGI/MIPS).
+  */
++#include <string.h>
+ #include "tiffioP.h"
+ #include "prototypes.h"
+ 
+diff -wpur libtiff/tif_dirwrite.c libtiff.2/tif_dirwrite.c
+--- libtiff/tif_dirwrite.c	1994-09-21 01:19:10.000000000 +0100
++++ libtiff.2/tif_dirwrite.c	2016-08-27 10:52:55.694937053 +0100
+@@ -36,6 +36,7 @@ static char rcsid[] = "$Header: /usr/peo
+  *     carefully chosen to make things work with compilers that
+  *     are busted in one way or another (e.g. SGI/MIPS).
+  */
++#include <string.h>
+ #include "tiffioP.h"
+ #include "prototypes.h"
+ 
+diff -wpur libtiff/tiffcompat.h libtiff.2/tiffcompat.h
+--- libtiff/tiffcompat.h	1994-09-21 01:19:27.000000000 +0100
++++ libtiff.2/tiffcompat.h	2016-08-27 10:44:13.647198539 +0100
+@@ -170,21 +170,7 @@ extern	long lseek();
+ #define	WriteOK(fd, buf, size)	(write(fd, (char *)buf, size) == size)
+ #endif
+ 
+-#if defined(__MACH__) || defined(THINK_C)
+-extern	void *malloc(size_t size);
+-extern	void *realloc(void *ptr, size_t size);
+-#else /* !__MACH__ && !THINK_C */
+-#if defined(MSDOS)
+-#include <malloc.h>
+-#else /* !MSDOS */
+-#if defined(_IBMR2)
+ #include <stdlib.h>
+-#else /* !_IBMR2 */
+-extern	char *malloc();
+-extern	char *realloc();
+-#endif /* _IBMR2 */
+-#endif /* !MSDOS */
+-#endif /* !__MACH__ */
+ 
+ /*
+  * dblparam_t is the type that a double precision
+diff -wpur libtiff/tiff.h libtiff.2/tiff.h
+--- libtiff/tiff.h	1994-09-21 01:19:27.000000000 +0100
++++ libtiff.2/tiff.h	2016-08-27 10:47:27.496732874 +0100
+@@ -250,4 +250,11 @@ typedef	enum {
+ #define	TIFFTAG_DATATYPE		32996	/* $use SampleFormat */
+ #define	TIFFTAG_IMAGEDEPTH		32997	/* z depth of image */
+ #define	TIFFTAG_TILEDEPTH		32998	/* z depth/data tile */
++
++/* types used by the lib */
++typedef unsigned short u_short;
++typedef unsigned int u_int;
++typedef unsigned long u_long;
++typedef unsigned char u_char;
++
+ #endif /* _TIFF_ */
+diff -wpur libtiff/tiffio.h libtiff.2/tiffio.h
+--- libtiff/tiffio.h	1994-09-21 01:19:27.000000000 +0100
++++ libtiff.2/tiffio.h	2016-08-27 10:56:11.227847352 +0100
+@@ -92,7 +92,7 @@ extern	int TIFFVGetField(TIFF*, int, va_
+ extern	int TIFFGetFieldDefaulted(TIFF*, int, ...);
+ extern	int TIFFVGetFieldDefaulted(TIFF*, int, va_list);
+ extern	int TIFFReadDirectory(TIFF*);
+-extern	int TIFFScanlineSize(TIFF*);
++extern	long TIFFScanlineSize(TIFF*);
+ extern	unsigned long TIFFStripSize(TIFF*);
+ extern	unsigned long TIFFVStripSize(TIFF*, unsigned long);
+ extern	unsigned long TIFFTileRowSize(TIFF*);
+diff -wpur libtiff/tif_open.c libtiff.2/tif_open.c
+--- libtiff/tif_open.c	1994-09-21 01:19:20.000000000 +0100
++++ libtiff.2/tif_open.c	2016-08-27 10:55:56.250957569 +0100
+@@ -29,6 +29,7 @@ static char rcsid[] = "$Header: /usr/peo
+ /*
+  * TIFF Library.
+  */
++#include <string.h>
+ #include "tiffioP.h"
+ #include "prototypes.h"
+ 
+@@ -292,6 +293,7 @@ bad2:
+ 	return ((TIFF *)0);
+ }
+ 
++long
+ TIFFScanlineSize(tif)
+ 	TIFF *tif;
+ {
+diff -wpur libtiff/tif_packbits.c libtiff.2/tif_packbits.c
+--- libtiff/tif_packbits.c	1994-09-21 01:19:20.000000000 +0100
++++ libtiff.2/tif_packbits.c	2016-08-27 10:56:41.794969494 +0100
+@@ -87,7 +87,7 @@ PackBitsEncodeChunk(tif, bp, cc, s)
+ 	int cc;
+ 	u_int s;
+ {
+-	int rowsize = (int) tif->tif_data;
++	long rowsize = (long) tif->tif_data;
+ 
+ 	assert(rowsize > 0);
+ 	while (cc > 0) {

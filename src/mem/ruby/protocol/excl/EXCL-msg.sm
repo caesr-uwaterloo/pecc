@@ -1,0 +1,131 @@
+/*
+* @author: Xinzhe Wang
+*/
+
+// CoherenceRequestType
+enumeration(CoherenceRequestType, desc="Types of coherence requests") {
+    GetS,           desc="Get read-only permission";
+    GetM,           desc="Get read/write permission";
+    Upg,            desc="Upgrade";
+    Put,            desc="Put";
+    BusRequest,     desc="Get bus request";
+}
+
+// RequestMsg
+structure(RequestMsg, desc="Coherence request message", interface="Message") {
+    Cycles                              reqID,                      desc="Associated request ID";
+    Addr                                addr,                       desc="Physical address for this request";
+    CoherenceRequestType                type,                       desc="Coherence request type";
+    MachineID                           requestor,                  desc="Requestor";
+    NetDest                             Destination,                desc="Multicast destination mask";
+    MessageSizeType                     MessageSize,                desc="size category of the message";
+    bool                                isOwnershipTransfer,        desc="Indicator of ownership transfer for Put request";
+    MachineID                           newOwner,                   desc="New owner";
+    NetDest                             sharers,                    desc="All L1 caches that share the line in valid state";
+    bool                                writeback,                  desc="Indicator of writeback";
+    DataBlock                           dataBlk,                    desc="Cache line data";
+    bool                                dirty,                      desc="Dirty bit of the cache line";
+
+    bool functionalRead(Packet *pkt) {
+        if (writeback)  {
+            return testAndRead(addr, dataBlk, pkt);
+        }
+        return false;
+    }
+
+    bool functionalWrite(Packet *pkt) {
+        // No check on message type required since the protocol should read 
+        // data block from only those messages that contain valid data
+        return testAndWrite(addr, dataBlk, pkt);
+    }
+}
+
+// CoherenceResponseType
+enumeration(CoherenceResponseType, desc="Types of response messages") {
+    CacheToCache, desc="Cache to cache data transfer";
+    FromLLC, desc="Data comes from LLC";
+    FromMemory, desc="Data comes from mem";
+    //Writeback, desc="Data eviction from L1 to LLC";
+    Ack, desc="Writeback acknowledgement";
+}
+
+// ResponseMsg
+structure(ResponseMsg, desc="Response message", interface="Message") {
+    Cycles                              reqID,             default="Cycles(0)", desc="Associated request ID";
+    Addr                                addr,              desc="Physical address of the cache line";
+    DataBlock                           dataBlk,           desc="Cache line data";
+    bool                                dirty,             desc="Dirty bit of the cache line";
+    
+    CoherenceResponseType               type,              desc="Response type";
+    MachineID                           sender,            desc="Sender of the response";
+    NetDest                             Destination,       desc="Multicast destination mask";
+    MessageSizeType                     MessageSize,       desc="size category of the message";
+    
+    bool functionalRead(Packet *pkt) {
+        if ((MessageSize == MessageSizeType:Response_Data))  {
+            return testAndRead(addr, dataBlk, pkt);
+        }
+        return false;
+    }
+
+    bool functionalWrite(Packet *pkt) {
+        // No check on message type required since the protocol should read 
+        // data block from only those messages that contain valid data
+        return testAndWrite(addr, dataBlk, pkt);
+    }
+}
+
+// For internal trigger event
+structure(TriggerMsg, interface="Message") {
+    Addr addr;
+    bool functionalRead(Packet *pkt) { return false; }
+    //bool functionalRead(Packet *pkt, WriteMask &mask) { return false; }
+    bool functionalWrite(Packet *pkt) { return false; }
+}
+
+structure(DirectoryMsg, desc="Memory message to/from directory", interface="Message") {
+    // This is basically a copy of MemoryMsg with additional Destination field
+    Addr addr,              desc="Physical address for this request";
+    MemoryRequestType Type,       desc="Type of memory request (MEMORY_READ or MEMORY_WB)";
+    MachineID Sender,             desc="What component sent the data";
+    MachineID OriginalRequestorMachId, desc="What component originally requested";
+    DataBlock DataBlk,            desc="Data to writeback";
+    MessageSizeType MessageSize,  desc="size category of the message";
+    int Len,                      desc="size of the memory/dma request";
+    // Not all fields used by all protocols:
+    PrefetchBit Prefetch,         desc="Is this a prefetch request";
+    bool ReadX,                   desc="Exclusive";
+    int Acks,                     desc="How many acks to expect";
+
+    NetDest Destination;
+
+    bool functionalRead(Packet *pkt) {
+        if ((MessageSize == MessageSizeType:Response_Data) ||
+            (MessageSize == MessageSizeType:Writeback_Data))  {
+            return testAndRead(addr, DataBlk, pkt);
+        }
+        return false;
+    }
+
+    bool functionalRead(Packet *pkt, WriteMask &mask) {
+        if ((MessageSize == MessageSizeType:Response_Data) ||
+            (MessageSize == MessageSizeType:Writeback_Data))  {
+            WriteMask read_mask;
+            read_mask.setMask(addressOffset(addr, makeLineAddress(addr)), Len, true);
+            if (MessageSize != MessageSizeType:Writeback_Data) {
+                read_mask.setInvertedMask(mask);
+            }
+            if (read_mask.isEmpty()) {
+                return false;
+            } else if (testAndReadMask(addr, DataBlk, read_mask, pkt)) {
+                mask.orMask(read_mask);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool functionalWrite(Packet *pkt) {
+        return testAndWrite(addr, DataBlk, pkt);
+    }
+}

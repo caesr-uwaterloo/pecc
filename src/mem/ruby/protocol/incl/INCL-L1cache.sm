@@ -1,0 +1,1153 @@
+/*
+* @author: Xinzhe Wang
+*/
+
+machine(MachineType:L1Cache, "L1 Cache") :
+    // Sequencer to insert Load/Store request
+    Sequencer *sequencer;
+    // Cache memory
+    CacheMemory *L1Icache;
+    CacheMemory *L1Dcache;
+
+    // boolean parameter indicating whether eviction callback is required
+    bool send_evictions;
+
+    // L2 select bits
+    int l2_select_num_bits;
+
+    // Latency
+    Cycles cache_access_latency;
+
+    // Interface to the network
+    // Bus request
+    MessageBuffer *busRequestOut, network="To", virtual_network="0", vnet_type="request";
+    MessageBuffer *busGrantIn, network="From", virtual_network="0", vnet_type="response";
+
+    // Coherence request and response
+    MessageBuffer *requestIn, network="From", virtual_network="1", vnet_type="request";
+    MessageBuffer *responseIn, network="From", virtual_network="2", vnet_type="response";
+    MessageBuffer *requestOut, network="To", virtual_network="1", vnet_type="request";
+    MessageBuffer *responseOut, network="To", virtual_network="2", vnet_type="response";
+
+    // Mandatory queue for receiving requests from the sequencer
+    MessageBuffer *mandatoryQueue;
+
+    // Internal trigger queue to finalize state transition
+    MessageBuffer *triggerQueue;
+
+    // Profiler
+    CustomProfiler *profiler;
+
+{
+    ////////////////////////////////////////////////////////////////////////////
+    // STATES
+    ////////////////////////////////////////////////////////////////////////////
+
+    state_declaration(State, desc="Cache states", default="L1Cache_State_I") {
+        // Stable states
+        I, AccessPermission:Invalid, desc="Not present (Invalid)";
+        S, AccessPermission:Read_Only, desc="Valid, read-only, shared, dirty/clean, without ownership";
+        O, AccessPermission:Read_Only, desc="Valid, read-only, shared, dirty/clean, without ownership";
+        E, AccessPermission:Read_Only, desc="Valid, read-only, unique, clean, with ownership";
+        M, AccessPermission:Read_Write, desc="Valid, read/write, unique, dirty, with ownership";
+
+        // Special stable state to support locked RMW atomic instruction
+        L, AccessPermission:Read_Write, desc="Locked in exclusive mode";
+
+        // Transient states
+        S_AD, AccessPermission:Busy, desc="Issued GetS but has not observed own GetS on bus";
+        S_D, AccessPermission:Busy, desc="Issued GetS, observed own GetS on bus but waiting for data";
+
+        M_AD, AccessPermission:Busy, desc="Issued GetM but has not observed own GetM on bus";
+        M_D, AccessPermission:Busy, desc="Issued GetM, observed own GetM on bus but waiting for data";
+
+        ML_AD, AccessPermission:Busy, desc="Same as M_AD but original request is Lock instead of GetM";
+        ML_D, AccessPermission:Busy, desc="Same as M_D but original request is Lock instead of GetM";
+
+        M_A, AccessPermission:Read_Only, desc="Issued Upg but has not observed Upg on bus";
+        ML_A, AccessPermission:Read_Only, desc="Same as M_A but original request is Lock instead of GetM";
+        
+        I_AD, AccessPermission:Busy, desc="Issued Put but has not observed Put on bus (Put has writeback)";
+        I_D, AccessPermission:Busy, desc="Observed Put but waiting for writeback acknowledge";
+
+        CMP, AccessPermission:Busy, desc="Completion state";
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // EVENTS
+    ////////////////////////////////////////////////////////////////////////////
+
+    enumeration(Event, desc="Cache events") {
+        // Events triggered by processor/sequencer/mandatory queue
+        Load;
+        Ifetch;
+        Store;
+        Lock;
+        Unlock;
+        Replacement;
+
+        // Event triggered by receiving bus grant
+        BusGrantDoGetM, desc="Bus grant is given, the pending action is GetM";
+        BusGrantDoGetMLocked, desc="Bus grant is given, the pending action is GetM with lock";
+        BusGrantDoGetS, desc="Bus grant is given, the pending action is Load";
+        BusGrantDoPut, desc="Bus grant is given, the pending action is Put";
+
+        // Events triggered by receiving requests
+        // Own requests
+        OwnGetM, desc="Observe own GetM";
+        OwnUpg, desc="Observe own Upg";
+        OwnGetS, desc="Observe own GetS";
+        OwnPut, desc="Observe own Put";
+        
+        // Other requests
+        OtherGetM, desc="Observe other GetM";
+        OtherGetS, desc="Observe other GetS";
+        OtherUpg, desc="Observe other Upg";
+        OtherPut, desc="Observe other Put";
+        Inv, desc="Observe invalidate request";
+
+        // Events triggered by receiving data response
+        DataFromMem, desc="Data comes from memory";
+        DataFromLLC, desc="Data comes from LLC";
+        DataCacheToCache, desc="Data comes from direct cache-to-cache transfer";
+        Ack, desc="Put acknowledge";
+
+        // Internal trigger event
+        Complete, desc="Completion event that finalizes state transition";
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // STRUCTURES
+    ////////////////////////////////////////////////////////////////////////////
+
+    // Cache Entry
+    structure(CacheEntry, desc="Cache entry", interface="AbstractCacheEntry") {
+        State state,            desc="Cache state";
+        DataBlock dataBlk,      desc="Data block";
+        bool dirty,             desc="Dirty bit";
+        bool owned,             desc="Owned?";
+        bool uniqueness,        default="true", desc="Unique?";
+    }
+
+    // TBE
+    structure(TBE, desc="Transaction buffer entry") {
+        // Duplicate of cache entry fields
+        State state,                            desc="TBE state";
+        
+        // Transaction buffer fields                   
+        CoherenceRequestType requestType,       desc="Pending request type";
+        Cycles reqID,                           desc="Request ID";
+        NetDest requestors,                     desc="Pending requestors";
+        bool isLockRequest,                     desc="Indicator of lock request";
+        Addr from_addr,                         desc="Address of request that triggers replacement";
+        bool to_I,                              desc="Indicator of invalidation";
+    }
+
+    structure(TBETable, external="yes") {
+        TBE lookup(Addr);
+        void allocate(Addr);
+        void deallocate(Addr);
+        bool isPresent(Addr);
+    }
+
+    TBETable TBEs, template="<L1Cache_TBE>", constructor="m_number_of_TBEs";
+
+    int l2_select_low_bit, default="RubySystem::getBlockSizeBits()";
+
+    ////////////////////////////////////////////////////////////////////////////
+    // FUNCTIONS
+    ////////////////////////////////////////////////////////////////////////////
+
+    // External functions
+    Cycles curCycle();
+    Tick clockEdge();
+    Cycles ticksToCycles(Tick t);
+    void set_cache_entry(AbstractCacheEntry a);
+    void unset_cache_entry();
+    void set_tbe(TBE b);
+    void unset_tbe();
+    MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+    
+    // Helper function
+
+    CacheEntry getCacheEntry(Addr address), return_by_pointer="yes" {
+        CacheEntry L1Dcache_entry := static_cast(CacheEntry, "pointer", L1Dcache.lookup(address));
+        CacheEntry L1Icache_entry := static_cast(CacheEntry, "pointer", L1Icache.lookup(address));
+        if (is_valid(L1Dcache_entry)) {
+            assert(is_invalid(L1Icache_entry));
+            return L1Dcache_entry;
+        }
+
+        return L1Icache_entry;
+    }
+
+    CacheEntry allocateIcacheEntry(Addr address), return_by_pointer="yes" {
+        CacheEntry cache_entry := static_cast(CacheEntry, "pointer", L1Icache.allocate(address, new CacheEntry));
+        return cache_entry;
+    }
+
+    CacheEntry allocateDcacheEntry(Addr address), return_by_pointer="yes" {
+        CacheEntry cache_entry := static_cast(CacheEntry, "pointer", L1Dcache.allocate(address, new CacheEntry));
+        return cache_entry;
+    }
+
+    void deallocateCacheEntry(Addr address) {
+        bool deallocated := false;
+        if (L1Dcache.isTagPresent(address)) {
+            L1Dcache.deallocate(address);
+            deallocated := true;
+        } else if (L1Icache.isTagPresent(address)) {
+            L1Icache.deallocate(address);
+            deallocated := true;
+        }
+        if (send_evictions && deallocated) {
+            sequencer.evictionCallback(address);
+        }
+    }
+
+    CacheEntry getL1DCacheEntry(Addr address), return_by_pointer="yes" {
+        CacheEntry L1Dcache_entry := static_cast(CacheEntry, "pointer", L1Dcache.lookup(address));
+        return L1Dcache_entry;
+    }
+
+    CacheEntry getL1ICacheEntry(Addr address), return_by_pointer="yes" {
+        CacheEntry L1Icache_entry := static_cast(CacheEntry, "pointer", L1Icache.lookup(address));
+        return L1Icache_entry;
+    }
+
+    // Interface functions required by SLICC
+
+    State getNextState(Addr address) {
+        TBE tbe := TBEs[address];
+        assert(is_valid(tbe));
+        CacheEntry cache_entry := getCacheEntry(address);
+        assert(is_valid(cache_entry));
+
+        if (tbe.to_I) {
+            return State:I;
+        }
+
+        bool dirty := cache_entry.dirty;
+        bool owned := cache_entry.owned;
+        bool uniqueness := cache_entry.uniqueness && owned;
+
+        // determine next stable state based on state characteristics
+        if (!owned) {
+            return State:S;
+        }
+        if (owned && uniqueness && dirty) {
+            return State:M;
+        }
+        if (owned && uniqueness && !dirty) {
+            return State:E;
+        }
+        return State:O;
+    }
+
+    State getState(TBE tbe, CacheEntry cache_entry, Addr addr) {
+        // The TBE state will override the state in cache memory, if valid
+        if (is_valid(tbe)) {
+            return tbe.state;
+        } else if (is_valid(cache_entry)) {
+            return cache_entry.state;
+        } else {
+            return State:I;
+        }
+    }
+
+    void setState(TBE tbe, CacheEntry cache_entry, Addr addr, State state) {
+        // Set the state in cache entry and tbe if available
+        if (is_valid(tbe)) {
+            tbe.state := state;
+        }
+        if (is_valid(cache_entry)) {
+            cache_entry.state := state;
+        }
+    }
+
+    AccessPermission getAccessPermission(Addr addr) {
+        TBE tbe := TBEs[addr];
+        if (is_valid(tbe)) {
+            return L1Cache_State_to_permission(tbe.state);
+        }
+
+        CacheEntry cache_entry := getCacheEntry(addr);
+        if (is_valid(cache_entry)) {
+            return L1Cache_State_to_permission(cache_entry.state);
+        }
+
+        return AccessPermission:NotPresent;
+    }
+
+    void setAccessPermission(CacheEntry cache_entry, Addr addr, State state) {
+        if (is_valid(cache_entry)) {
+            cache_entry.changePermission(L1Cache_State_to_permission(state));
+        }
+    }
+
+    void functionalRead(Addr addr, Packet *pkt) {
+        CacheEntry cache_entry := getCacheEntry(addr);
+        assert(is_valid(cache_entry));
+        testAndRead(addr, cache_entry.dataBlk, pkt);
+    }
+
+    int functionalWrite(Addr addr, Packet *pkt) {
+        int num_functional_writes := 0;
+        CacheEntry cache_entry := getCacheEntry(addr);
+        if (is_valid(cache_entry)) {
+            num_functional_writes := num_functional_writes + testAndWrite(addr, cache_entry.dataBlk, pkt);
+        }
+        return num_functional_writes;
+    }
+
+
+    ////////////////////////////////////////////////////////////////////////////
+    // NETWORK PORTS
+    ////////////////////////////////////////////////////////////////////////////
+
+    out_port(busRequestOutPort, RequestMsg, busRequestOut);
+    out_port(requestOutPort, RequestMsg, requestOut);
+    out_port(responseOutPort, ResponseMsg, responseOut);
+    out_port(triggerOutPort, TriggerMsg, triggerQueue);
+
+    // internally triggered event for finalizing state transition
+    in_port(triggerInPort, TriggerMsg, triggerQueue) {
+        if (triggerInPort.isReady(clockEdge())) {
+            peek(triggerInPort, TriggerMsg) {
+                TBE tbe := TBEs[in_msg.addr];
+                CacheEntry cache_entry := getCacheEntry(in_msg.addr);
+                trigger(Event:Complete, in_msg.addr, cache_entry, tbe);
+            }
+        }
+    }
+
+    in_port(busGrantInPort, RequestMsg, busGrantIn) {
+        if (busGrantInPort.isReady(clockEdge())) {
+            peek(busGrantInPort, RequestMsg) {
+                CacheEntry cache_entry := getCacheEntry(in_msg.addr);
+                TBE tbe := TBEs[in_msg.addr];
+                assert(in_msg.type == CoherenceRequestType:BusRequest);
+                assert(is_valid(tbe));
+                if (tbe.requestType == CoherenceRequestType:GetS) {
+                    trigger(Event:BusGrantDoGetS, in_msg.addr, cache_entry, tbe);
+                } else if (tbe.requestType == CoherenceRequestType:GetM) {
+                    if (tbe.isLockRequest) {
+                        trigger(Event:BusGrantDoGetMLocked, in_msg.addr, cache_entry, tbe);
+                    } else {
+                        trigger(Event:BusGrantDoGetM, in_msg.addr, cache_entry, tbe);
+                    }
+                } else if (tbe.requestType == CoherenceRequestType:Put) {
+                    trigger(Event:BusGrantDoPut, in_msg.addr, cache_entry, tbe);
+                } else {
+                    error("Unexpected pending request type in TBE");
+                }
+            }
+        }
+    }
+
+    in_port(responseInPort, ResponseMsg, responseIn) {
+        if (responseInPort.isReady(clockEdge())) {
+            peek(responseInPort, ResponseMsg) {
+                CacheEntry cache_entry := getCacheEntry(in_msg.addr);
+                TBE tbe := TBEs[in_msg.addr];
+                assert(is_valid(tbe));
+
+                if (in_msg.type == CoherenceResponseType:Ack) {
+                    trigger(Event:Ack, in_msg.addr, cache_entry, tbe);
+                } else if (in_msg.type == CoherenceResponseType:FromLLC) {
+                    trigger(Event:DataFromLLC, in_msg.addr, cache_entry, tbe);
+                } else if (in_msg.type == CoherenceResponseType:FromMemory) {
+                    trigger(Event:DataFromMem, in_msg.addr, cache_entry, tbe);
+                } else if (in_msg.type == CoherenceResponseType:CacheToCache) {
+                    trigger(Event:DataCacheToCache, in_msg.addr, cache_entry, tbe);
+                } else {
+                    error("Unexpected data response type");
+                }
+                
+            }
+        }
+    }
+
+    in_port(requestInPort, RequestMsg, requestIn) {
+        if (requestInPort.isReady(clockEdge())) {
+            peek(requestInPort, RequestMsg) {
+                CacheEntry cache_entry := getCacheEntry(in_msg.addr);
+                TBE tbe := TBEs[in_msg.addr];
+
+                if (in_msg.requestor == machineID) {
+                    // own requests
+                    if (in_msg.type == CoherenceRequestType:GetS) {
+                        trigger(Event:OwnGetS, in_msg.addr, cache_entry, tbe);
+                    } else if (in_msg.type == CoherenceRequestType:GetM) {
+                        trigger(Event:OwnGetM, in_msg.addr, cache_entry, tbe);
+                    } else if (in_msg.type == CoherenceRequestType:Put) {
+                        trigger(Event:OwnPut, in_msg.addr, cache_entry, tbe);
+                    } else if (in_msg.type == CoherenceRequestType:Upg) {
+                        trigger(Event:OwnUpg, in_msg.addr, cache_entry, tbe);
+                    } else {
+                        error("L1 controller: unexpected coherence request");
+                    }
+                } else {
+                    // other requests
+                    if (in_msg.type == CoherenceRequestType:GetS) {
+                        trigger(Event:OtherGetS, in_msg.addr, cache_entry, tbe);
+                    } else if (in_msg.type == CoherenceRequestType:GetM) {
+                        trigger(Event:OtherGetM, in_msg.addr, cache_entry, tbe);
+                    } else if (in_msg.type == CoherenceRequestType:Upg) {
+                        trigger(Event:OtherUpg, in_msg.addr, cache_entry, tbe);
+                    } else if (in_msg.type == CoherenceRequestType:Put) {
+                        trigger(Event:OtherPut, in_msg.addr, cache_entry, tbe);
+                    } else if (in_msg.type == CoherenceRequestType:Inv) {
+                        trigger(Event:Inv, in_msg.addr, cache_entry, tbe);
+                    } else {
+                        error("L1 controller: unexpected coherence request");
+                    }
+                }
+            }
+        }
+    }
+
+    in_port(mandatoryInPort, RubyRequest, mandatoryQueue) {
+        if (mandatoryInPort.isReady(clockEdge())) {
+            peek(mandatoryInPort, RubyRequest) {
+                Addr address := in_msg.LineAddress;
+                CacheEntry L1Icache_entry := getL1ICacheEntry(address);
+                CacheEntry L1Dcache_entry := getL1DCacheEntry(address);
+                assert((is_valid(L1Icache_entry) && is_valid(L1Dcache_entry)) == false);
+                CacheEntry cache_entry := getCacheEntry(address);
+                TBE tbe := TBEs[address];
+
+                bool replacementTriggered := false;
+                if (is_invalid(cache_entry)) {
+                    if (in_msg.Type == RubyRequestType:IFETCH) {
+                        if (L1Icache.cacheAvail(address)) {
+                            // if cache block available, allocate a new entry
+                            cache_entry := allocateIcacheEntry(address);
+                            assert(is_valid(cache_entry));
+                        } else {
+                            // otherwise, select a victim for replacement
+                            Addr victim_addr := L1Icache.cacheProbe(address);
+                            CacheEntry victim_entry := getCacheEntry(victim_addr);
+                            TBE victim_tbe := TBEs[victim_addr];
+                            assert(is_valid(victim_entry));
+                            assert(is_invalid(victim_tbe));
+                            trigger(Event:Replacement, victim_addr, victim_entry, victim_tbe);
+                            replacementTriggered := true;
+                        }
+                    } else {
+                        if (L1Dcache.cacheAvail(address)) {
+                            // if cache block available, allocate a new entry
+                            cache_entry := allocateDcacheEntry(address);
+                            assert(is_valid(cache_entry));
+                        } else {
+                            // otherwise, select a victim for replacement
+                            Addr victim_addr := L1Dcache.cacheProbe(address);
+                            CacheEntry victim_entry := getCacheEntry(victim_addr);
+                            TBE victim_tbe := TBEs[victim_addr];
+                            assert(is_valid(victim_entry));
+                            assert(is_invalid(victim_tbe));
+                            trigger(Event:Replacement, victim_addr, victim_entry, victim_tbe);
+                            replacementTriggered := true;
+                        }
+                    }
+                }
+
+                if (replacementTriggered == false) {
+                    if (
+                        in_msg.Type == RubyRequestType:IFETCH
+                    ) {
+                        //DPRINTF(RubySlicc, "Trigger ifetch event\n");
+                        trigger(Event:Ifetch, in_msg.LineAddress, cache_entry, tbe);
+                    } else if (
+                        in_msg.Type == RubyRequestType:LD
+                    ) {
+                        trigger(Event:Load, in_msg.LineAddress, cache_entry, tbe);
+                    } else if (
+                        in_msg.Type == RubyRequestType:ST
+                    ) {
+                        trigger(Event:Store, in_msg.LineAddress, cache_entry, tbe);
+                    } else if (
+                        in_msg.Type == RubyRequestType:Locked_RMW_Read
+                    ) {
+                        DPRINTF(RubySlicc, "Trigger lock event\n");
+                        trigger(Event:Lock, in_msg.LineAddress, cache_entry, tbe);
+                    } else if (
+                        in_msg.Type == RubyRequestType:Locked_RMW_Write
+                    ) {
+                        DPRINTF(RubySlicc, "Trigger unlock event\n");
+                        trigger(Event:Unlock, in_msg.LineAddress, cache_entry, tbe);
+                    } else {
+                        DPRINTF(RubySlicc, "Unexpected request from processor %s\n", RubyRequestType_to_string(in_msg.Type));
+                        error("Unexpected request from processor");
+                    }
+                }
+            }
+        }
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // ACTIONS
+    ////////////////////////////////////////////////////////////////////////////
+
+    // Actions on out_port
+
+    action(triggerLocalReqCompletion, desc="...") {
+        enqueue(triggerOutPort, TriggerMsg, 0) {
+            out_msg.addr := address;
+        }
+    }
+
+    action(sendBusRequest, desc="...") {
+        enqueue(busRequestOutPort, RequestMsg, cache_access_latency) {
+            out_msg.addr := address;
+            out_msg.type := CoherenceRequestType:BusRequest;
+            out_msg.requestor := machineID;
+            // Hack here: the destination will be modified by the central switch
+            out_msg.Destination.broadcast(MachineType:Directory);
+            out_msg.MessageSize := MessageSizeType:Control;
+        }
+    }
+
+    action(sendGetS, desc="Issue GetS") {
+        assert(is_valid(tbe));
+        profiler.profileGetRequest();
+        enqueue(requestOutPort, RequestMsg, 1) {
+            out_msg.reqID := curCycle();
+            out_msg.addr := address;
+            out_msg.type := CoherenceRequestType:GetS;
+            out_msg.requestor := machineID;
+            out_msg.Destination.clear();
+            out_msg.Destination.broadcast(MachineType:L1Cache);
+            out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
+                                    l2_select_low_bit, l2_select_num_bits, intToID(0)));
+            out_msg.MessageSize := MessageSizeType:Control;
+        }
+    }
+
+    action(sendGetM, desc="Issue GetM") {
+        assert(is_valid(tbe));
+        profiler.profileGetRequest();
+        enqueue(requestOutPort, RequestMsg, 1) {
+            out_msg.reqID := curCycle();
+            out_msg.reqID := curCycle();
+            out_msg.addr := address;
+            out_msg.type := CoherenceRequestType:GetM;
+            out_msg.requestor := machineID;
+            out_msg.Destination.clear();
+            out_msg.Destination.broadcast(MachineType:L1Cache);
+            out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
+                                    l2_select_low_bit, l2_select_num_bits, intToID(0)));
+            out_msg.MessageSize := MessageSizeType:Control;
+        }
+    }
+
+    action(sendUpg, desc="Issue Upg") {
+        assert(is_valid(tbe));
+        enqueue(requestOutPort, RequestMsg, 1) {
+            out_msg.reqID := curCycle();
+            out_msg.addr := address;
+            out_msg.type := CoherenceRequestType:Upg;
+            out_msg.requestor := machineID;
+            out_msg.Destination.clear();
+            out_msg.Destination.broadcast(MachineType:L1Cache);
+            out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
+                                    l2_select_low_bit, l2_select_num_bits, intToID(0)));
+            out_msg.MessageSize := MessageSizeType:Control;
+        }
+    }
+
+    action(sendPut, desc="Issue Put") {
+        assert(is_valid(tbe));
+        assert(is_valid(cache_entry));
+        profiler.profilePutRequest();
+        enqueue(requestOutPort, RequestMsg, 1) {
+            out_msg.reqID := curCycle();
+            out_msg.addr := address;
+            out_msg.type := CoherenceRequestType:Put;
+            out_msg.requestor := machineID;
+            out_msg.dataBlk := cache_entry.dataBlk;
+            out_msg.dirty := cache_entry.dirty;
+            out_msg.Destination.clear();
+            out_msg.Destination.broadcast(MachineType:L1Cache);
+            out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
+                                    l2_select_low_bit, l2_select_num_bits, intToID(0)));
+            out_msg.MessageSize := MessageSizeType:Control;
+        }
+    }
+
+    action(sendDataResponse, desc="Send data response to requestor") {
+        peek(requestInPort, RequestMsg) {
+            if (is_valid(cache_entry)) {
+                enqueue(responseOutPort, ResponseMsg, cache_access_latency) {
+                    out_msg.reqID := in_msg.reqID;
+                    out_msg.addr := address;
+                    out_msg.type := CoherenceResponseType:CacheToCache;
+                    out_msg.sender := machineID;
+                    // Only send data to requestor
+                    out_msg.Destination.add(in_msg.requestor);
+                    out_msg.dataBlk := cache_entry.dataBlk;
+                    out_msg.dirty := cache_entry.dirty;
+                    out_msg.MessageSize := MessageSizeType:Response_Data;
+                }
+            }
+        }
+    }
+
+    // Actions on local hit / external hit
+
+    action(loadHit, desc="Load hit") {
+        assert(is_valid(cache_entry));
+        profiler.profileL1Hit();
+        L1Icache.setMRU(cache_entry);
+        L1Dcache.setMRU(cache_entry);
+        sequencer.readCallback(address, cache_entry.dataBlk, false);
+    }
+
+    action(externalLoadHit, desc="External load hit (was a miss)") {
+        assert(is_valid(cache_entry));
+        profiler.profileL1Miss();
+        peek(responseInPort, ResponseMsg) {
+            if (in_msg.type == CoherenceResponseType:FromLLC) {
+                profiler.profileLLCHit();
+            } else if (in_msg.type == CoherenceResponseType:FromMemory) {
+                profiler.profileMemoryRead();
+            } else if (in_msg.type == CoherenceResponseType:CacheToCache) {
+                profiler.profileCacheToCacheTrf();
+            }
+            L1Icache.setMRU(cache_entry);
+            L1Dcache.setMRU(cache_entry);
+            sequencer.readCallback(address, cache_entry.dataBlk, true, 
+                                   machineIDToMachineType(in_msg.sender));
+        }
+    }
+
+    action(storeHit, desc="Store hit") {
+        assert(is_valid(cache_entry));
+        profiler.profileL1Hit();
+        L1Icache.setMRU(cache_entry);
+        L1Dcache.setMRU(cache_entry);
+        sequencer.writeCallback(address, cache_entry.dataBlk, false);
+        cache_entry.dirty := true;
+    }
+
+    action(externalStoreHit, desc="External store hit (was a miss)") {
+        assert(is_valid(cache_entry));
+        profiler.profileL1Miss();
+        peek(responseInPort, ResponseMsg) {
+            if (in_msg.type == CoherenceResponseType:FromLLC) {
+                profiler.profileLLCHit();
+            } else if (in_msg.type == CoherenceResponseType:FromMemory) {
+                profiler.profileMemoryRead();
+            } else if (in_msg.type == CoherenceResponseType:CacheToCache) {
+                profiler.profileCacheToCacheTrf();
+            }
+            L1Icache.setMRU(cache_entry);
+            L1Dcache.setMRU(cache_entry);
+            sequencer.writeCallback(address, cache_entry.dataBlk, true,
+                                    machineIDToMachineType(in_msg.sender));
+        }
+        cache_entry.dirty := true;
+    }
+
+    action(upgStoreHit, desc="Upgrade store hit (was a miss)") {
+        assert(is_valid(cache_entry));
+        profiler.profileL1Miss();
+        profiler.profileUpg();
+        L1Icache.setMRU(cache_entry);
+        L1Dcache.setMRU(cache_entry);
+        sequencer.writeCallback(address, cache_entry.dataBlk, true,
+                                machineIDToMachineType(machineID));
+        cache_entry.dirty := true;
+    }
+
+    // Actions on cache entry and TBE
+
+    action(invalidateCacheEntry, desc="...") {
+        // if tbe is invalid, meaning no pending request, just deallocate the cache entry
+        if (is_invalid(tbe)) {
+            deallocateCacheEntry(address);
+            unset_cache_entry();
+        } else {
+            // otherwise, reset cache entry field
+            if (is_valid(cache_entry)) {
+                cache_entry.owned := false;
+                cache_entry.dirty := false;
+                cache_entry.uniqueness := true;
+            }
+        }
+    }
+
+    action(deallocateCacheEntry, desc="...") {
+        assert(is_invalid(tbe));
+        deallocateCacheEntry(address);
+        unset_cache_entry();
+    }
+
+    action(allocateTBE, desc="Allocate TBE") {
+        check_allocate(TBEs);
+        assert(is_invalid(tbe));
+        TBEs.allocate(address);
+        set_tbe(TBEs[address]);
+    }
+
+    action(initiateReplacement, desc="...") {
+        assert(is_valid(tbe));
+        peek(mandatoryInPort, RubyRequest) {
+            tbe.from_addr := in_msg.LineAddress;
+        }
+        Addr stalled_address := tbe.from_addr;
+        stall_and_wait(mandatoryInPort, stalled_address);
+        tbe.requestType := CoherenceRequestType:Put;
+    }
+
+    action(initiateGetS, desc="...") {
+        assert(is_valid(tbe));
+        tbe.requestType := CoherenceRequestType:GetS;
+    }
+
+    action(initiateGetM, desc="...") {
+        assert(is_valid(tbe));
+        tbe.requestType := CoherenceRequestType:GetM;
+    }
+
+    action(initiateGetMLocked, desc="...") {
+        assert(is_valid(tbe));
+        tbe.requestType := CoherenceRequestType:GetM;
+        tbe.isLockRequest := true;
+    }
+
+    action(writeDataResponseToCache, desc="Write data response to the cache") {
+        peek(responseInPort, ResponseMsg) {
+            assert(is_valid(cache_entry));
+            cache_entry.dataBlk := in_msg.dataBlk;
+            cache_entry.dirty := in_msg.dirty;
+        }
+    }
+
+    action(setOwned, desc="") {
+        assert(is_valid(cache_entry));
+        cache_entry.owned := true;
+    }
+
+    action(setToI, desc="") {
+        assert(is_valid(tbe));
+        tbe.to_I := true;
+    }
+
+    action(setUniqueness, desc="") {
+        assert(is_valid(cache_entry));
+        cache_entry.uniqueness := true;
+    }
+
+    action(unsetUniqueness, desc="") {
+        assert(is_valid(cache_entry));
+        cache_entry.uniqueness := false;
+    }
+
+    action(checkAndAddRequestor, desc="Add requestor") {
+        assert(is_valid(tbe));
+        if (!tbe.to_I) {
+            peek(requestInPort, RequestMsg) {
+                tbe.requestors.add(in_msg.requestor);
+                // record the request ID of the first request
+                if (tbe.requestors.count() == 0) {
+                    tbe.reqID := in_msg.reqID;
+                }
+            }
+        }
+    }
+
+    action(finalizeTransaction, desc="...") {
+        // Coherence request completed, deallocate tbe entry
+        assert(is_valid(tbe));
+        if (tbe.requestType == CoherenceRequestType:Put) {
+            // if transaction is replacement
+            Addr from_addr := tbe.from_addr;
+            // deallocate cache entry
+            deallocateCacheEntry(address);
+            unset_cache_entry();
+            // cache set has space now, wake up dependent request
+            wakeup_port(mandatoryInPort, from_addr);
+        } else {
+            // if transaction is Store or Lock or Load or Inv request,
+            // forward response to potential pending requestors
+            assert(is_valid(cache_entry));
+            int num_requestors := tbe.requestors.count();
+            if (cache_entry.owned && (num_requestors > 0)) {
+                enqueue(responseOutPort, ResponseMsg, 1) {
+                    out_msg.reqID := tbe.reqID;
+                    out_msg.addr := address;
+                    out_msg.type := CoherenceResponseType:CacheToCache;
+                    out_msg.sender := machineID;
+                    // Only send data to requestor
+                    out_msg.Destination := tbe.requestors;
+                    out_msg.dataBlk := cache_entry.dataBlk;
+                    out_msg.dirty := cache_entry.dirty;
+                    out_msg.MessageSize := MessageSizeType:Response_Data;
+                }
+            }
+            if (tbe.to_I) {
+                deallocateCacheEntry(address);
+                unset_cache_entry();
+            }
+        }
+
+        TBEs.deallocate(address);
+        unset_tbe();
+    }
+
+    // Actions on in_port
+
+    action(popMandatoryQueue, desc="Pop the mandatory queue") {
+        mandatoryInPort.dequeue(clockEdge());
+    }
+
+    action(popTriggerQueue, desc="...") {
+        triggerInPort.dequeue(clockEdge());
+    }
+
+    action(popBusGrantQueue, desc="...") {
+        busGrantInPort.dequeue(clockEdge());
+    }
+
+    action(popResponseQueue, desc="Pop the response queue") {
+        responseInPort.dequeue(clockEdge());
+    }
+
+    action(popRequestQueue, desc="Pop the request queue") {
+        requestInPort.dequeue(clockEdge());
+    }
+
+    // Actions: sanity check
+    action(assertTBEValid, desc="...") {
+        assert(is_valid(tbe));
+    }
+
+    action(assertTBEInvalid, desc="...") {
+        assert(is_invalid(tbe));
+    }
+
+    action(assertCacheEntryValid, desc="...") {
+        assert(is_valid(cache_entry));
+    }
+
+    action(assertCacheEntryInvalid, desc="...") {
+        assert(is_invalid(cache_entry));
+    }
+
+    // Actions: profiler
+    action(profileBI, desc="...") {
+        profiler.profileBackInvalidation();
+    }
+
+    action(profileBIWB, desc="...") {
+        profiler.profileBackInvalidationWB();
+    }
+
+
+    ////////////////////////////////////////////////////////////////////////////
+    // TRANSITIONS
+    ////////////////////////////////////////////////////////////////////////////
+    
+    // Transition on CPU request
+
+    transition({I, S}, Replacement) {
+        deallocateCacheEntry;
+    }
+
+    transition({E, O, M}, Replacement) {
+        allocateTBE;
+        initiateReplacement;
+        sendBusRequest;
+    }
+
+    transition({S, O, E, M}, {Ifetch, Load}) {
+        loadHit;
+        popMandatoryQueue;
+    }
+
+    transition(I, {Ifetch, Load}) {
+        allocateTBE;
+        initiateGetS;
+        sendBusRequest;
+        popMandatoryQueue;
+    }
+
+    transition(I, Store) {
+        allocateTBE;
+        initiateGetM;
+        sendBusRequest;
+        popMandatoryQueue;
+    }
+
+    transition(I, Lock) {
+        allocateTBE;
+        initiateGetMLocked;
+        sendBusRequest;
+        popMandatoryQueue;
+    }
+
+    transition({M, E}, Store, M) {
+        storeHit;
+        popMandatoryQueue;
+    }
+
+    transition({M, E}, Lock, L) {
+        allocateTBE;
+        initiateGetMLocked;
+        storeHit;
+        popMandatoryQueue;
+    }
+
+    transition({S, O}, Store) {
+        allocateTBE;
+        initiateGetM;
+        sendBusRequest;
+        popMandatoryQueue;
+    }
+
+    transition({S, O}, Lock) {
+        allocateTBE;
+        initiateGetMLocked;
+        sendBusRequest;
+        popMandatoryQueue;
+    }
+
+    transition(L, Unlock, CMP) {
+        storeHit;
+        popMandatoryQueue;
+        triggerLocalReqCompletion;
+    }
+
+    // Transition on observing other coherence request in stable states
+
+    transition(I, Inv) {
+        popRequestQueue;
+    }
+
+    transition(S, Inv, I) {
+        profileBI;
+        invalidateCacheEntry;
+        popRequestQueue;
+    }
+
+    transition({O, E, M}, Inv, I) {
+        profileBI;
+        profileBIWB;
+        sendDataResponse;
+        invalidateCacheEntry;
+        popRequestQueue;
+    }
+
+    transition(I, {OtherGetM, OtherGetS, OtherUpg, OtherPut}) {
+        popRequestQueue;
+    }
+
+    transition(S, {OtherUpg, OtherGetM}, I) {
+        invalidateCacheEntry;
+        popRequestQueue;
+    }
+
+    transition(O, OtherUpg, I) {
+        invalidateCacheEntry
+        popRequestQueue;
+    }
+
+    transition({O, E, M}, OtherGetM, I) {
+        sendDataResponse;
+        invalidateCacheEntry;
+        popRequestQueue;
+    }
+
+    transition(S, OtherGetS) {
+        popRequestQueue;
+    }
+
+    transition({O, E, M}, OtherGetS, O) {
+        unsetUniqueness;
+        sendDataResponse;
+        popRequestQueue;
+    }
+
+    transition({S, O}, OtherPut) {
+        popRequestQueue;
+    }
+
+    // Transitions on observing other coherence requests in transient states or L state
+
+    transition(S_D, {OtherGetM, Inv}) {
+        checkAndAddRequestor;
+        setToI;
+        popRequestQueue;
+    }
+
+    transition(S_D, OtherUpg) {
+        setToI;
+        popRequestQueue;
+    }
+
+    transition(S_D, OtherGetS) {
+        unsetUniqueness;
+        checkAndAddRequestor;
+        popRequestQueue;
+    }
+
+    transition(S_D, OtherPut) {
+        popRequestQueue;
+    }
+
+    transition({M_D, ML_D, L}, {OtherGetM, Inv}) {
+        checkAndAddRequestor;
+        setToI;
+        popRequestQueue;
+    }
+
+    transition({M_D, ML_D, L}, OtherGetS) {
+        unsetUniqueness;
+        checkAndAddRequestor;
+        popRequestQueue;
+    }
+
+    transition(I_D, {OtherGetM, OtherGetS, OtherPut, OtherUpg, Inv}) {
+        popRequestQueue;
+    }
+
+    // Transition on acquiring bus
+
+    transition(I, BusGrantDoPut, CMP) {
+        popBusGrantQueue;
+        triggerLocalReqCompletion;
+    }
+
+    transition(I, BusGrantDoGetS, S_AD) {
+        sendGetS;
+        popBusGrantQueue;
+    }
+
+    transition(I, BusGrantDoGetM, M_AD) {
+        sendGetM;
+        popBusGrantQueue;
+    }
+
+    transition(I, BusGrantDoGetMLocked, ML_AD) {
+        sendGetM;
+        popBusGrantQueue;
+    }
+
+    transition({S, O}, BusGrantDoGetM, M_A) {
+        sendUpg;
+        popBusGrantQueue;
+    }
+
+    transition({S, O}, BusGrantDoGetMLocked, ML_A) {
+        sendUpg;
+        popBusGrantQueue;
+    }
+
+    transition({E, M}, BusGrantDoGetM, CMP) {
+        setOwned;
+        upgStoreHit;
+        popBusGrantQueue;
+        triggerLocalReqCompletion;
+    }
+
+    transition({E, M}, BusGrantDoGetMLocked, L) {
+        upgStoreHit;
+        popBusGrantQueue;
+    }
+    
+    transition({E, O, M}, BusGrantDoPut, I_AD) {
+        sendPut;
+        popBusGrantQueue;
+    }
+
+    // Transition on observing own coherence request
+
+    transition(S_AD, OwnGetS, S_D) {
+        popRequestQueue;
+    }
+
+    transition(M_AD, OwnGetM, M_D) {
+        setOwned;
+        setUniqueness;
+        popRequestQueue;
+    }
+
+    transition(ML_AD, OwnGetM, ML_D) {
+        setOwned;
+        setUniqueness;
+        popRequestQueue;
+    }
+
+    transition(M_A, OwnUpg, CMP) {
+        setOwned;
+        setUniqueness;
+        upgStoreHit;
+        popRequestQueue;
+        triggerLocalReqCompletion;
+    }
+
+    transition(ML_A, OwnUpg, L) {
+        setOwned;
+        setUniqueness;
+        upgStoreHit;
+        popRequestQueue;
+    }
+
+    transition(I_AD, OwnPut, I_D) {
+        setToI;
+        popRequestQueue;
+    }
+
+    // Transition on receiving response
+
+    transition(I_D, Ack, CMP) {
+        popResponseQueue;
+        triggerLocalReqCompletion;
+    }
+
+    transition(S_D, DataFromLLC, CMP) {
+        unsetUniqueness;
+        writeDataResponseToCache;
+        externalLoadHit;
+        popResponseQueue;
+        triggerLocalReqCompletion;
+    }
+
+    transition(S_D, DataFromMem, CMP) {
+        setOwned;
+        writeDataResponseToCache;
+        externalLoadHit;
+        popResponseQueue;
+        triggerLocalReqCompletion;
+    }
+
+    transition(S_D, DataCacheToCache, CMP) {
+        unsetUniqueness;
+        writeDataResponseToCache;
+        externalLoadHit;
+        popResponseQueue;
+        triggerLocalReqCompletion;
+    }
+
+    transition(M_D, {DataFromLLC, DataFromMem, DataCacheToCache}, CMP) {
+        writeDataResponseToCache;
+        externalStoreHit;
+        popResponseQueue;
+        triggerLocalReqCompletion;
+    }
+
+    transition(ML_D, {DataFromLLC, DataFromMem, DataCacheToCache}, L) {
+        writeDataResponseToCache;
+        externalStoreHit;
+        popResponseQueue;
+    }
+
+    // Transition on finalizing transaction
+
+    transition(CMP, Complete, *) {
+        finalizeTransaction;
+        popTriggerQueue;
+    }
+
+}

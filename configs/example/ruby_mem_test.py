@@ -115,17 +115,17 @@ Ruby.create_system(args, False, system, dma_ports = dma_ports)
 
 # Create a top-level voltage domain and clock domain
 system.voltage_domain = VoltageDomain(voltage = args.sys_voltage)
-system.clk_domain = SrcClockDomain(clock = args.sys_clock,
+system.clk_domain = SrcClockDomain(clock = "2GHz",
                                    voltage_domain = system.voltage_domain)
 # Create a seperate clock domain for Ruby
-system.ruby.clk_domain = SrcClockDomain(clock = args.ruby_clock,
+system.ruby.clk_domain = SrcClockDomain(clock = "4GHz",
                                         voltage_domain = system.voltage_domain)
 
 #
 # The tester is most effective when randomization is turned on and
 # artifical delay is randomly inserted on messages
 #
-system.ruby.randomization = True
+system.ruby.randomization = False
 
 assert(len(cpus) == len(system.ruby._cpu_ports))
 
@@ -149,7 +149,7 @@ root = Root( full_system = False, system = system )
 root.system.mem_mode = 'timing'
 
 # Not much point in this being higher than the L1 latency
-m5.ticks.setGlobalFrequency('1ns')
+m5.ticks.setGlobalFrequency('0.25ns')
 
 # instantiate configuration
 m5.instantiate()

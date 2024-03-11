@@ -417,6 +417,8 @@ class HistStor
     /** Counter for each bucket. */
     VCounter cvec;
 
+    Counter max_val;
+
     /**
      * Given a bucket size B, and a range of values [0, N], this function
      * doubles the bucket size to double the range of values towards the
@@ -518,7 +520,7 @@ class HistStor
         data.bucket_size = bucket_size;
 
         data.min_val = min_bucket;
-        data.max_val = max_bucket;
+        data.max_val = max_val;
 
         int buckets = params->buckets;
         data.cvec.resize(buckets);
@@ -550,6 +552,8 @@ class HistStor
         squares = Counter();
         samples = Counter();
         logs = Counter();
+        max_val = Counter();
+        max_val = 0;
     }
 };
 

@@ -1,0 +1,209 @@
+/*
+* @author Xinzhe Wang
+*/
+
+// The directory only acts as an interface port that forwards memory request/response
+machine(MachineType:Directory, "Directory") :
+    // Directory memory
+    DirectoryMemory *directory;
+
+    // L2 select bits
+    int l2_select_num_bits;
+    
+    // Interface to the network
+    MessageBuffer *requestIn, network="From", virtual_network="3", vnet_type="request";
+    MessageBuffer *responseOut, network="To", virtual_network="4", vnet_type="response";
+
+    // Interface to the memory
+    MessageBuffer *requestToMemory;
+    MessageBuffer *responseFromMemory;
+
+{
+
+    ////////////////////////////////////////////////////////////////////////////
+    // STATES
+    ////////////////////////////////////////////////////////////////////////////
+
+    state_declaration(State, desc="State", default="Directory_State_Mem") {
+        // stable states
+        Mem, AccessPermission:Backing_Store, desc="...";
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // EVENTS
+    ////////////////////////////////////////////////////////////////////////////
+
+    enumeration(Event, desc="Cache events") {
+        // Events triggered by receiving requests
+        Request, desc="...";
+        Response, desc="...";
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // STRUCTURES
+    ////////////////////////////////////////////////////////////////////////////
+
+    // Directory entry
+    structure(Entry, desc="Directory entry", interface="AbstractCacheEntry", main="false") {
+        State state, desc="State";
+    }
+
+    // TBE
+    // TBE is not really used here
+    structure(TBE, desc="Transaction buffer entry") {
+        bool dummy_field;
+    }
+
+    structure(TBETable, external="yes") {
+        TBE lookup(Addr);
+        void allocate(Addr);
+        void deallocate(Addr);
+        bool isPresent(Addr);
+        bool areNSlotsAvailable(int, Tick);
+    }
+
+    TBETable TBEs, template="<Directory_TBE>", constructor="m_number_of_TBEs";
+
+    int l2_select_low_bit, default="RubySystem::getBlockSizeBits()";
+
+    ////////////////////////////////////////////////////////////////////////////
+    // FUNCTIONS
+    ////////////////////////////////////////////////////////////////////////////
+
+    // External functions
+    Cycles curCycle();
+    Tick clockEdge();
+    Cycles ticksToCycles(Tick t);
+    void set_tbe(TBE b);
+    void unset_tbe();
+    MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+
+    // Helper function
+    Entry getDirectoryEntry(Addr addr), return_by_pointer="yes" {
+        Entry dir_entry := static_cast(Entry, "pointer", directory[addr]);
+
+        if (is_valid(dir_entry)) {
+            return dir_entry;
+        }
+
+        dir_entry := static_cast(Entry, "pointer", directory.allocate(addr, new Entry));
+        return dir_entry;
+    }
+
+    // Interface functions required by SLICC
+    State getState(TBE tbe, Addr addr) {
+        return getDirectoryEntry(addr).state;
+    }
+
+    void setState(TBE tbe, Addr addr, State state) {
+        getDirectoryEntry(addr).state := state;
+    }
+
+    AccessPermission getAccessPermission(Addr addr) {
+        if (directory.isPresent(addr)) {
+            return Directory_State_to_permission(getDirectoryEntry(addr).state);
+        }
+        return AccessPermission:Backing_Store;
+    }
+
+    void setAccessPermission(Addr addr, State state) {
+        if (directory.isPresent(addr)) {
+            getDirectoryEntry(addr).changePermission(Directory_State_to_permission(state));
+        }
+    }
+
+    void functionalRead(Addr addr, Packet *pkt) {
+        functionalMemoryRead(pkt);
+    }
+
+    int functionalWrite(Addr addr, Packet *pkt) {
+        int num_functional_writes := 0;
+        num_functional_writes := num_functional_writes + functionalMemoryWrite(pkt);
+        return num_functional_writes;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // NETWORK PORTS
+    ////////////////////////////////////////////////////////////////////////////
+
+    out_port(responseOutPort, DirectoryMsg, responseOut);
+    out_port(requestToMemoryOutPort, MemoryMsg, requestToMemory);
+
+    in_port(responseFromMemoryInPort, MemoryMsg, responseFromMemory) {
+        if (responseFromMemoryInPort.isReady(clockEdge())) {
+            peek(responseFromMemoryInPort, MemoryMsg) {
+                TBE tbe := TBEs[in_msg.addr];
+                trigger(Event:Response, in_msg.addr, tbe);
+            }
+        }
+    }
+
+    in_port(requestInPort, DirectoryMsg, requestIn) {
+        if (requestInPort.isReady(clockEdge())) {
+            peek(requestInPort, DirectoryMsg) {
+                TBE tbe := TBEs[in_msg.addr];
+                trigger(Event:Request, in_msg.addr, tbe);
+            }
+        }
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // ACTIONS
+    ////////////////////////////////////////////////////////////////////////////
+
+    // actions on out_port
+
+    action(forwardMemRequest, desc="Forward memory request") {
+        peek(requestInPort, DirectoryMsg) {
+            enqueue(requestToMemoryOutPort, MemoryMsg, 1) {
+                out_msg.addr := in_msg.addr;
+                out_msg.Type := in_msg.Type;
+                out_msg.Sender := in_msg.Sender;
+                out_msg.MessageSize := in_msg.MessageSize;
+                out_msg.DataBlk := in_msg.DataBlk;
+                out_msg.Len := in_msg.Len;
+            }
+        }
+    }
+
+    action(forwardMemResponse, desc="Forward memory data response") {
+        peek(responseFromMemoryInPort, MemoryMsg) {
+            enqueue(responseOutPort, DirectoryMsg, 1) {
+                out_msg.addr := in_msg.addr;
+                out_msg.Type := in_msg.Type;
+                out_msg.Sender := in_msg.Sender;
+                out_msg.DataBlk := in_msg.DataBlk;
+                out_msg.MessageSize := in_msg.MessageSize;
+                out_msg.OriginalRequestorMachId := in_msg.OriginalRequestorMachId;
+                out_msg.Destination.clear();
+                out_msg.Destination.add(mapAddressToRange(out_msg.addr, MachineType:L2Cache,
+                                        l2_select_low_bit, l2_select_num_bits, intToID(0)));
+            }
+        }
+    }
+
+    // actions on in_port
+
+    action(popMemResponseQueue, desc="Pop the memory response queue") {
+        responseFromMemoryInPort.dequeue(clockEdge());
+    }
+
+    action(popRequestQueue, desc="Pop the request queue") {
+        requestInPort.dequeue(clockEdge());
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // TRANSITIONS
+    ////////////////////////////////////////////////////////////////////////////
+
+    transition(Mem, Request) {
+        forwardMemRequest;
+        popRequestQueue;
+    }
+
+    transition(Mem, Response) {
+        forwardMemResponse;
+        popMemResponseQueue;
+    }
+
+}

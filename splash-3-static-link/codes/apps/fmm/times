@@ -1,0 +1,28 @@
+TIMING:
+2	16384	1.00e-06	5
+Time Step 0
+Processor 0
+	Total Time = 0
+Processor 1
+	Total Time = 0
+Time Step 1
+Processor 0
+	Total Time = 0
+Processor 1
+	Total Time = 0
+Time Step 2
+Processor 0
+	Total Time = 1
+Processor 1
+	Total Time = 1
+Time Step 3
+Processor 0
+	Total Time = 0
+Processor 1
+	Total Time = 0
+Time Step 4
+Processor 0
+	Total Time = 1
+Processor 1
+	Total Time = 1
+END

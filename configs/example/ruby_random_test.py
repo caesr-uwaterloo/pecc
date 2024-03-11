@@ -64,14 +64,14 @@ args = parser.parse_args()
 # Set the default cache size and associativity to be very small to encourage
 # races between requests and writebacks.
 #
-args.l1d_size="256B"
-args.l1i_size="256B"
-args.l2_size="512B"
-args.l3_size="1kB"
-args.l1d_assoc=2
-args.l1i_assoc=2
-args.l2_assoc=2
-args.l3_assoc=2
+# args.l1d_size="256B"
+# args.l1i_size="256B"
+# args.l2_size="2048B"
+# args.l3_size="1kB"
+# args.l1d_assoc=2
+# args.l1i_assoc=2
+# args.l2_assoc=2
+# args.l3_assoc=2
 
 #
 # Create the ruby random tester
@@ -96,7 +96,7 @@ system = System(cpu = tester, mem_ranges = [AddrRange(args.mem_size)])
 # Create a top-level voltage domain and clock domain
 system.voltage_domain = VoltageDomain(voltage = args.sys_voltage)
 
-system.clk_domain = SrcClockDomain(clock = args.sys_clock,
+system.clk_domain = SrcClockDomain(clock = "2GHz",
                                    voltage_domain = system.voltage_domain)
 
 # the ruby tester reuses num_cpus to specify the
@@ -108,7 +108,7 @@ cpu_list = [ system.cpu ] * args.num_cpus
 Ruby.create_system(args, False, system, cpus=cpu_list)
 
 # Create a seperate clock domain for Ruby
-system.ruby.clk_domain = SrcClockDomain(clock = args.ruby_clock,
+system.ruby.clk_domain = SrcClockDomain(clock = "4GHz",
                                         voltage_domain = system.voltage_domain)
 
 assert(args.num_cpus == len(system.ruby._cpu_ports))
@@ -119,7 +119,8 @@ tester.num_cpus = len(system.ruby._cpu_ports)
 # The tester is most effective when randomization is turned on and
 # artifical delay is randomly inserted on messages
 #
-system.ruby.randomization = True
+#system.ruby.randomization = True
+system.ruby.randomization = False  # I dont want randomization...
 
 for ruby_port in system.ruby._cpu_ports:
     #
@@ -149,7 +150,7 @@ root = Root( full_system = False, system = system )
 root.system.mem_mode = 'timing'
 
 # Not much point in this being higher than the L1 latency
-m5.ticks.setGlobalFrequency('1ns')
+m5.ticks.setGlobalFrequency('0.25ns')
 
 # instantiate configuration
 m5.instantiate()

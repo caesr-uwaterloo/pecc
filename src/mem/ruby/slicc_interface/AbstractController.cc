@@ -364,6 +364,10 @@ AbstractController::functionalMemoryWrite(PacketPtr pkt)
 {
     int num_functional_writes = 0;
 
+    // TODO: check this
+    MessageBuffer *req_queue = getMemReqQueue();
+    req_queue->functionalWrite(pkt);
+
     // Update memory itself.
     memoryPort.sendFunctional(pkt);
     return num_functional_writes + 1;

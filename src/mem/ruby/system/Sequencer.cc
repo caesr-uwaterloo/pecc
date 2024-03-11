@@ -799,12 +799,14 @@ Sequencer::makeRequest(PacketPtr pkt)
         if (pkt->isWrite()) {
             DPRINTF(RubySequencer, "Issuing Locked RMW Write\n");
             primary_type = RubyRequestType_Locked_RMW_Write;
+            secondary_type = RubyRequestType_Locked_RMW_Write;
         } else {
             DPRINTF(RubySequencer, "Issuing Locked RMW Read\n");
             assert(pkt->isRead());
             primary_type = RubyRequestType_Locked_RMW_Read;
+            secondary_type = RubyRequestType_Locked_RMW_Read;
         }
-        secondary_type = RubyRequestType_ST;
+        // secondary_type = RubyRequestType_ST;
     } else if (pkt->req->isTlbiCmd()) {
         primary_type = secondary_type = tlbiCmdToRubyRequestType(pkt);
         DPRINTF(RubySequencer, "Issuing TLBI\n");

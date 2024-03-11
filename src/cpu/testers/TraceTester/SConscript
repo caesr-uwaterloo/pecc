@@ -1,0 +1,7 @@
+Import('*')
+
+SimObject('TraceTester.py', sim_objects=['TraceTester'])
+
+Source('TraceTester.cc')
+
+DebugFlag('TraceTester')

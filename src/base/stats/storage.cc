@@ -176,6 +176,10 @@ HistStor::growUp()
 void
 HistStor::sample(Counter val, int number)
 {
+    if (val > max_val) {
+        max_val = val;
+    }
+
     assert(min_bucket < max_bucket);
     if (val < min_bucket) {
         if (min_bucket == 0)
@@ -212,6 +216,10 @@ HistStor::add(HistStor *hs)
     int b_size = hs->size();
     assert(size() == b_size);
     assert(min_bucket == hs->min_bucket);
+
+    if (hs->max_val > max_val) {
+        max_val = hs->max_val;
+    }
 
     sum += hs->sum;
     logs += hs->logs;

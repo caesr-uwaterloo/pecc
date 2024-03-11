@@ -68,6 +68,7 @@ DebugFlag('RubyTester')
 DebugFlag('RubyStats')
 DebugFlag('RubyResourceStalls')
 DebugFlag('RubyProtocol')
+DebugFlag('TDM')
 
 CompoundFlag('Ruby', [ 'RubyQueue', 'RubyNetwork', 'RubyTester',
     'RubyGenerated', 'RubySlicc', 'RubySystem', 'RubyCache',
@@ -127,3 +128,5 @@ MakeInclude('system/Sequencer.hh')
 MakeInclude('system/GPUCoalescer.hh')
 MakeInclude('system/HTMSequencer.hh')
 MakeInclude('system/VIPERCoalescer.hh')
+
+MakeInclude('profiler/CustomProfiler.hh')
